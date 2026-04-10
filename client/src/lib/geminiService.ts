@@ -20,47 +20,75 @@ export async function chatWithGemini(
     // We capture the toolData to return to the UI separately so it can render the download buttons
     let capturedToolData: any = null;
 
-    const searchTool = tool(async (args) => {
-        onToolCall('search_email_attachments', args);
-
-        const mcpArgs = {
-            ...args,
-            ...imapSettings
-        };
-
+    const executeMcpTool = async (args: any, requestedToolName: string) => {
+        onToolCall(requestedToolName, args);
+        const mcpArgs = { ...args, ...imapSettings };
         try {
-            const result = await mcpService.callTool('search_email_attachments', mcpArgs);
+            const result = await mcpService.callTool(requestedToolName, mcpArgs);
             const textResult = result.content[0].text;
-
+            
             try {
                 const parsed = JSON.parse(textResult);
-                if (Array.isArray(parsed) && parsed.length > 0) {
-                    capturedToolData = result.content; // Pass it to the UI
-                    // Tell the AI it succeeded
-                    return `Found ${parsed.length} attachments! Result: ${textResult}`;
-                } else {
-                    return `0 attachments found matching "${args.filenameQuery}". HINT: The search failed. Do NOT guess the full filename. Try using a DIFFERENT or SHORTER single keyword.`;
+                
+                // If it's a download action and succeeded, capture for the UI
+                if (requestedToolName === 'download_attachment' && Array.isArray(parsed) && parsed.length > 0) {
+                    capturedToolData = result.content; 
+                    return `Successfully downloaded attachment ${args.filename}!`;
                 }
-            } catch (e) {
-                return `Search executed. Result: ${textResult}`;
-            }
 
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    return `Found ${parsed.length} results! Result: ${textResult}`;
+                } else if (Array.isArray(parsed) && parsed.length === 0) {
+                    return `0 results found. Try using a DIFFERENT or BROADER search query.`;
+                }
+                
+                return textResult;
+            } catch (e) {
+                return `Tool executed. Result: ${textResult}`;
+            }
         } catch (err: any) {
             return `Error running tool: ${err.message}`;
         }
-    }, {
-        name: "search_email_attachments",
-        description: "Search email inbox for specific attachments. IMPORTANT: Do NOT guess full filenames. Provide ONLY 1-2 core keywords (e.g. 'Passport'). The system uses exact substring matching. If it fails, try a simpler word.",
+    };
+
+    const searchEmailsBySubjectTool = tool(async (args) => executeMcpTool(args, 'search_emails_by_subject'), {
+        name: "search_emails_by_subject",
+        description: "Search email inbox by subject to find emails. Returns list of matches with UID, subject, and attachments (metadata only).",
         schema: z.object({
-            filenameQuery: z.string().describe("SIMPLIFIED single keyword. DO NOT INCLUDE FILE EXTENSIONS or long phrases."),
-            senderQuery: z.string().optional().describe("MUST BE A SINGLE WORD FIRST NAME or exact email. Do NOT use full names (e.g. 'Viraj Shirodkar') as IMAP will fail. Use just 'Viraj'"),
+            subjectQuery: z.string().describe("A keyword to search for in email subjects."),
+            senderQuery: z.string().optional().describe("MUST BE A SINGLE WORD FIRST NAME or exact email."),
         })
     });
 
+    const searchEmailsByContextTool = tool(async (args) => executeMcpTool(args, 'search_emails_by_context'), {
+        name: "search_emails_by_context",
+        description: "Search email inbox using a broad context query (checks body, subject, etc.). Returns list of matches with UID, subject, and attachments (metadata only). Useful if you don't know the exact subject.",
+        schema: z.object({
+            contextQuery: z.string().describe("A broad keyword or phrase related to the email content."),
+            senderQuery: z.string().optional().describe("MUST BE A SINGLE WORD FIRST NAME or exact email."),
+        })
+    });
+
+    const downloadAttachmentTool = tool(async (args) => executeMcpTool(args, 'download_attachment'), {
+        name: "download_attachment",
+        description: "Downloads the specified attachment base64 content. MUST be used ONLY after finding the correct email UID via one of the search tools.",
+        schema: z.object({
+            uid: z.number().describe("The exact numeric UID of the email."),
+            filename: z.string().describe("The exact filename of the attachment to download from that email."),
+        })
+    });
+
+    const systemPrompt = `You are Mail Boy, an AI assistant. Help users manage and download their email attachments.
+Your workflow:
+1. First, search for emails using EITHER 'search_emails_by_subject' OR 'search_emails_by_context'.
+2. If multiple options are returned, ask the user which one they would like to download by listing the subjects/filenames. DO NOT try to download them all at once.
+3. Once the user clearly chooses an option (or if there's only one obvious option), use the 'download_attachment' tool, passing the exact 'uid' and 'filename' of the requested attachment.
+IMPORTANT: Never use download_attachment before you have the precise UID from a search tool.`;
+
     const agent = createReactAgent({
         llm,
-        tools: [searchTool],
-        messageModifier: new SystemMessage("You are Mail Boy, an AI assistant. Help users manage email attachments. Use the search_email_attachments tool. Do not guess exact filenames; use single simple keywords because the search is strict substring matching. If a search gives 0 results, TRY AGAIN automatically with an even simpler word before giving up. The IMAP credentials will be magically passed in the background."),
+        tools: [searchEmailsBySubjectTool, searchEmailsByContextTool, downloadAttachmentTool],
+        messageModifier: new SystemMessage(systemPrompt),
     });
 
     const langGraphMessages = history.map(msg =>
